@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Fri Aug 29 2025 21:28:35 2025
 @author: EunSeo_Michelle_Choi
 
 Python script for in silico NGS (PacBio) clonal analysis of antibody library and screen outputs.
