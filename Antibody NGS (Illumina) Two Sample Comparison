@@ -1,0 +1,214 @@
+# -*- coding: utf-8 -*-
+"""
+@author: EunSeo_Michelle_Choi
+
+Python script for comparative analysis of two antibody NGS (Illumina) datasets.
+This script:
+- Reads two separate FASTQ files and extracts the same specific region flanking a constant motif
+- Translates in-frame DNA sequences to protein
+- Performs clonal analysis for each sample (counts and frequency of unique protein sequences)
+- Computes mutation matrices relative to a wild-type (WT) antibody sequence
+- Outputs:
+  - CSVs with clonal frequencies per file
+  - Excel files with amino acid mutation count and fraction matrices per file
+  - PNG heatmaps of mutation frequency (with and without labels)
+  - CSV comparing frequency ratios of shared protein clones between the two files
+  - TXT summary of sequencing stats and sequencing depth using:
+    Sequencing depth = Total reads / Region length (bp)
+"""
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+from collections import Counter
+import pandas as pd
+
+# Constants
+END_SEQ = '' # insert END_SEQ of ~10bp flanking the 3` end of the region of interest in ''
+WT = '' # insert amino acid sequence of the region of interest (e.g primary sequence of CDRL3)
+residues = np.array(['G','A','V','L','I','P','S','T','N','Q','D','E','K','R','H','Y','F','W','C','M','*'], dtype='object')
+
+FASTQ_PATH_1 = r'' # insert first FASTQ file path in ''
+FASTQ_PATH_2 = r'' # insert second FASTQ file path in ''
+
+FILE_BASENAME_1 = os.path.basename(FASTQ_PATH_1).replace('.fastq', '')
+OUTPUT_DIR_1 = os.path.join(os.path.dirname(FASTQ_PATH_1), FILE_BASENAME_1)
+os.makedirs(OUTPUT_DIR_1, exist_ok=True)
+
+FILE_BASENAME_2 = os.path.basename(FASTQ_PATH_2).replace('.fastq', '')
+OUTPUT_DIR_2 = os.path.join(os.path.dirname(FASTQ_PATH_2), FILE_BASENAME_2)
+os.makedirs(OUTPUT_DIR_2, exist_ok=True)
+
+# FASTQ reader
+def read_fastq_sequences_only(filepath):
+    sequences = []
+    with open(filepath) as f:
+        while True:
+            f.readline()
+            seq = f.readline().strip()
+            f.readline()
+            f.readline()
+            if not seq:
+                break
+            sequences.append(seq)
+    return sequences
+
+# Extract 33 bp region upstream of END_SEQ. NOTE: 33 bp is an example; replace 33 with the bp length of the region of interest.
+def extract_flanked_regions(sequences, end_seq, length):
+    sliced = []
+    for seq in sequences:
+        match = re.search(end_seq, seq)
+        if match and match.start() >= length:
+            region = seq[match.start() - length:match.start()]
+            if len(region) == length and 'N' not in region:
+                sliced.append(region)
+    return sliced
+
+# Translate DNA to protein
+def translate(seq):
+    table = {
+        'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M', 'ACA':'T', 'ACC':'T', 'ACG':'T', 'ACT':'T',
+        'AAC':'N', 'AAT':'N', 'AAA':'K', 'AAG':'K', 'AGC':'S', 'AGT':'S', 'AGA':'R', 'AGG':'R',
+        'CTA':'L', 'CTC':'L', 'CTG':'L', 'CTT':'L', 'CCA':'P', 'CCC':'P', 'CCG':'P', 'CCT':'P',
+        'CAC':'H', 'CAT':'H', 'CAA':'Q', 'CAG':'Q', 'CGA':'R', 'CGC':'R', 'CGG':'R', 'CGT':'R',
+        'GTA':'V', 'GTC':'V', 'GTG':'V', 'GTT':'V', 'GCA':'A', 'GCC':'A', 'GCG':'A', 'GCT':'A',
+        'GAC':'D', 'GAT':'D', 'GAA':'E', 'GAG':'E', 'GGA':'G', 'GGC':'G', 'GGG':'G', 'GGT':'G',
+        'TCA':'S', 'TCC':'S', 'TCG':'S', 'TCT':'S', 'TTC':'F', 'TTT':'F', 'TTA':'L', 'TTG':'L',
+        'TAC':'Y', 'TAT':'Y', 'TAA':'*', 'TAG':'*', 'TGC':'C', 'TGT':'C', 'TGA':'*', 'TGG':'W',
+    }
+    if len(seq) % 3 != 0:
+        return ""
+    return ''.join([table.get(seq[i:i+3], 'X') for i in range(0, len(seq), 3)])
+
+# Mutation matrix (including WT)
+def compute_mutation_matrix(proteins, wt, residues):
+    mat = np.zeros((len(wt), len(residues)))
+    for p in proteins:
+        for i, aa in enumerate(p):
+            if i >= len(wt): continue
+            if aa in residues:
+                j = np.where(residues == aa)[0][0]
+                mat[i, j] += 1
+    return mat
+
+# Clonal analysis
+def clonal_analysis(dna_list, protein_list):
+    clone_counter = Counter(protein_list)
+    total = sum(clone_counter.values())
+    clone_data = []
+    for protein, count in clone_counter.items():
+        clone_data.append({
+            "Protein Sequence": protein,
+            "Count": count,
+            "Frequency": count / total
+        })
+    clone_df = pd.DataFrame(clone_data).sort_values(by='Count', ascending=False).reset_index(drop=True)
+    return clone_df
+
+# Compute frequency ratio by Protein Sequence
+def compute_frequency_ratio_by_protein(df1, df2):
+    merged = pd.merge(df1, df2, on="Protein Sequence", how="outer", suffixes=(f'_{FILE_BASENAME_1}', f'_{FILE_BASENAME_2}')).fillna(0)
+    merged[f"Frequency_Ratio_{FILE_BASENAME_1}_over_{FILE_BASENAME_2}"] = merged.apply(
+        lambda row: (row[f"Frequency_{FILE_BASENAME_1}"] / row[f"Frequency_{FILE_BASENAME_2}"]) if row[f"Frequency_{FILE_BASENAME_2}"] > 0 else np.nan,
+        axis=1)
+    return merged
+
+# Print and save stats including sequencing depth. NOTE: 33 bp is an example; replace 33 with the bp length of the region of interest.
+def print_and_save_stats(file_name, total_reads, sliced_reads, translated_proteins, region_length=33):
+    percent_in_frame = 100 * sliced_reads / total_reads if total_reads > 0 else 0
+    sequencing_depth = total_reads / region_length if region_length > 0 else 0
+    stats_text = (
+        f"{file_name} - Total reads: {total_reads}\n"
+        f"{file_name} - Valid {region_length}-bp sliced reads: {sliced_reads}\n"
+        f"{file_name} - Translated protein sequences: {translated_proteins}\n"
+        f"{file_name} - Percent in-frame: {percent_in_frame:.2f}%\n"
+        f"{file_name} - Sequencing depth: {sequencing_depth:.2f} (Total reads / {region_length} bp)\n"
+    )
+    print(stats_text)
+    return stats_text
+
+# --- Process file 1 ---
+seqs1 = read_fastq_sequences_only(FASTQ_PATH_1)
+sliced_seqs1 = extract_flanked_regions(seqs1, END_SEQ, 33) # NOTE: 33 bp is an example; replace 33 with the bp length of the region of interest.
+proteins1 = [translate(seq) for seq in sliced_seqs1 if translate(seq)]
+
+stats1 = print_and_save_stats(FILE_BASENAME_1, len(seqs1), len(sliced_seqs1), len(proteins1), region_length=33) # NOTE: 33 bp is an example; replace 33 with the bp length of the region of interest.
+
+clone_df1 = clonal_analysis(sliced_seqs1, proteins1)
+clone_csv1 = os.path.join(OUTPUT_DIR_1, f"{FILE_BASENAME_1}_clonal_analysis.csv")
+clone_df1.to_csv(clone_csv1, index=False)
+
+mutation_matrix1 = compute_mutation_matrix(proteins1, WT, residues)
+total_per_position1 = mutation_matrix1.sum(axis=1, keepdims=True)
+mutation_fraction1 = mutation_matrix1 / total_per_position1
+
+# --- Process file 2 ---
+seqs2 = read_fastq_sequences_only(FASTQ_PATH_2)
+sliced_seqs2 = extract_flanked_regions(seqs2, END_SEQ, 33) # NOTE: 33 bp is an example; replace 33 with the bp length of the region of interest.
+proteins2 = [translate(seq) for seq in sliced_seqs2 if translate(seq)]
+
+stats2 = print_and_save_stats(FILE_BASENAME_2, len(seqs2), len(sliced_seqs2), len(proteins2), region_length=33) # NOTE: 33 bp is an example; replace 33 with the bp length of the region of interest.
+
+clone_df2 = clonal_analysis(sliced_seqs2, proteins2)
+clone_csv2 = os.path.join(OUTPUT_DIR_2, f"{FILE_BASENAME_2}_clonal_analysis.csv")
+clone_df2.to_csv(clone_csv2, index=False)
+
+mutation_matrix2 = compute_mutation_matrix(proteins2, WT, residues)
+total_per_position2 = mutation_matrix2.sum(axis=1, keepdims=True)
+mutation_fraction2 = mutation_matrix2 / total_per_position2
+
+# Compute frequency ratio by Protein Sequence
+freq_ratio_df = compute_frequency_ratio_by_protein(clone_df1, clone_df2)
+freq_ratio_csv = os.path.join(OUTPUT_DIR_1, f"{FILE_BASENAME_1}_vs_{FILE_BASENAME_2}_frequency_ratio_by_protein.csv")
+freq_ratio_df.to_csv(freq_ratio_csv, index=False)
+
+# Save mutation matrices for file 1
+df_counts_1 = pd.DataFrame(mutation_matrix1.astype(int), columns=residues, index=[f"{i+1} {WT[i]}" for i in range(len(WT))])
+df_fractions_1 = pd.DataFrame(mutation_fraction1, columns=residues, index=[f"{i+1} {WT[i]}" for i in range(len(WT))])
+with pd.ExcelWriter(os.path.join(OUTPUT_DIR_1, f"{FILE_BASENAME_1}_mutation_fractions.xlsx")) as writer:
+    df_fractions_1.to_excel(writer, sheet_name="Fractions")
+    df_counts_1.to_excel(writer, sheet_name="Counts")
+
+# Save mutation matrices for file 2
+df_counts_2 = pd.DataFrame(mutation_matrix2.astype(int), columns=residues, index=[f"{i+1} {WT[i]}" for i in range(len(WT))])
+df_fractions_2 = pd.DataFrame(mutation_fraction2, columns=residues, index=[f"{i+1} {WT[i]}" for i in range(len(WT))])
+with pd.ExcelWriter(os.path.join(OUTPUT_DIR_2, f"{FILE_BASENAME_2}_mutation_fractions.xlsx")) as writer:
+    df_fractions_2.to_excel(writer, sheet_name="Fractions")
+    df_counts_2.to_excel(writer, sheet_name="Counts")
+
+# Heatmap function
+def plot_heatmap(matrix, with_labels, filename, output_dir):
+    plt.figure(figsize=(10, 6))
+    im = plt.imshow(matrix, cmap='viridis', aspect='auto')
+    plt.colorbar(label='Mutation Fraction')
+    plt.xticks(np.arange(len(residues)), residues)
+    plt.yticks(np.arange(len(WT)), [f"{i+1} {WT[i]}" for i in range(len(WT))])
+    plt.xlabel("Amino Acid")
+    plt.ylabel("Position")
+    if with_labels:
+        for i in range(matrix.shape[0]):
+            for j in range(matrix.shape[1]):
+                val = matrix[i, j]
+                if not np.isnan(val):
+                    plt.text(j, i, f"{val:.2f}", ha='center', va='center', fontsize=7, color='white')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, filename), dpi=300)
+    plt.close()
+
+# Generate heatmaps for file 1
+plot_heatmap(mutation_fraction1, with_labels=False, filename=f"{FILE_BASENAME_1}_heatmap.png", output_dir=OUTPUT_DIR_1)
+plot_heatmap(mutation_fraction1, with_labels=True, filename=f"{FILE_BASENAME_1}_heatmap_labeled.png", output_dir=OUTPUT_DIR_1)
+
+# Generate heatmaps for file 2
+plot_heatmap(mutation_fraction2, with_labels=False, filename=f"{FILE_BASENAME_2}_heatmap.png", output_dir=OUTPUT_DIR_2)
+plot_heatmap(mutation_fraction2, with_labels=True, filename=f"{FILE_BASENAME_2}_heatmap_labeled.png", output_dir=OUTPUT_DIR_2)
+
+# Save stats to a separate txt file including sequencing depth and formula used
+stats_file_path = os.path.join(OUTPUT_DIR_1, f"{FILE_BASENAME_1}_vs_{FILE_BASENAME_2}_stats.txt")
+with open(stats_file_path, "w") as f:
+    f.write(stats1 + "\n" + stats2)
+    f.write("\nSequencing depth formula used:\n")
+    f.write("Sequencing depth = Total reads / Region length (bp)\n")
+    
+
