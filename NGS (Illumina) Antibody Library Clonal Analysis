@@ -1,0 +1,148 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Aug 29 2025 21:28:35 2025
+@author: EunSeo_Michelle_Choi
+
+Python script for in silico NGS (PacBio) clonal analysis of antibody library and screen outputs.
+This script:
+- Reads FASTQ files and extracts a specific region flanking a constant motif
+- Translates in-frame DNA sequences to protein
+- Counts and outputs unique DNA/protein clones and their frequencies as CSV
+- Calculates per-position mutation matrices and exports Excel sheets with counts and fractions
+- Generates labeled and unlabeled heatmaps to visualize mutational frequency across CDRL3
+"""
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+from collections import Counter
+import pandas as pd
+
+# Constants
+END_SEQ = '' # insert END_SEQ of ~10bp flanking the 3` end of the region of interest in ''
+WT = ''# insert amino acid sequence of the region of interest (e.g primary sequence of CDRL3)
+residues = np.array(['G','A','V','L','I','P','S','T','N','Q','D','E','K','R','H','Y','F','W','C','M','*'], dtype='object')
+FASTQ_PATH = r'' # insert file path for FASTQ file in ''
+FILE_BASENAME = os.path.basename(FASTQ_PATH).replace('.fastq', '')
+OUTPUT_DIR = os.path.join(os.path.dirname(FASTQ_PATH), FILE_BASENAME)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# FASTQ reader
+def read_fastq_sequences_only(filepath):
+    sequences = []
+    with open(filepath) as f:
+        while True:
+            f.readline()
+            seq = f.readline().strip()
+            f.readline()
+            f.readline()
+            if not seq:
+                break
+            sequences.append(seq)
+    return sequences
+
+# Extract 33 bp region upstream of END_SEQ. NOTE: 33 bp is an example; replace 33 with the bp length of the region of interest.
+def extract_flanked_regions(sequences, end_seq, length):
+    sliced = []
+    for seq in sequences:
+        match = re.search(end_seq, seq)
+        if match and match.start() >= length:
+            region = seq[match.start() - length:match.start()]
+            if len(region) == length and 'N' not in region:
+                sliced.append(region)
+    return sliced
+
+# Translate DNA to protein
+def translate(seq):
+    table = {
+        'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M', 'ACA':'T', 'ACC':'T', 'ACG':'T', 'ACT':'T',
+        'AAC':'N', 'AAT':'N', 'AAA':'K', 'AAG':'K', 'AGC':'S', 'AGT':'S', 'AGA':'R', 'AGG':'R',
+        'CTA':'L', 'CTC':'L', 'CTG':'L', 'CTT':'L', 'CCA':'P', 'CCC':'P', 'CCG':'P', 'CCT':'P',
+        'CAC':'H', 'CAT':'H', 'CAA':'Q', 'CAG':'Q', 'CGA':'R', 'CGC':'R', 'CGG':'R', 'CGT':'R',
+        'GTA':'V', 'GTC':'V', 'GTG':'V', 'GTT':'V', 'GCA':'A', 'GCC':'A', 'GCG':'A', 'GCT':'A',
+        'GAC':'D', 'GAT':'D', 'GAA':'E', 'GAG':'E', 'GGA':'G', 'GGC':'G', 'GGG':'G', 'GGT':'G',
+        'TCA':'S', 'TCC':'S', 'TCG':'S', 'TCT':'S', 'TTC':'F', 'TTT':'F', 'TTA':'L', 'TTG':'L',
+        'TAC':'Y', 'TAT':'Y', 'TAA':'*', 'TAG':'*', 'TGC':'C', 'TGT':'C', 'TGA':'*', 'TGG':'W',
+    }
+    if len(seq) % 3 != 0:
+        return ""
+    return ''.join([table.get(seq[i:i+3], 'X') for i in range(0, len(seq), 3)])
+
+# Mutation matrix (including WT)
+def compute_mutation_matrix(proteins, wt, residues):
+    mat = np.zeros((len(wt), len(residues)))
+    for p in proteins:
+        for i, aa in enumerate(p):
+            if i >= len(wt): continue
+            if aa in residues:
+                j = np.where(residues == aa)[0][0]
+                mat[i, j] += 1
+    return mat
+
+# Clonal analysis
+def clonal_analysis(dna_list, protein_list):
+    clone_counter = Counter(zip(dna_list, protein_list))
+    total = sum(clone_counter.values())
+    clone_data = []
+    for (dna, protein), count in clone_counter.items():
+        clone_data.append({
+            "DNA Sequence": dna,
+            "Protein Sequence": protein,
+            "Count": count,
+            "Frequency": count / total
+        })
+    clone_df = pd.DataFrame(clone_data).sort_values(by='Count', ascending=False).reset_index(drop=True)
+    return clone_df
+
+# Read and process
+seqs = read_fastq_sequences_only(FASTQ_PATH)
+sliced_seqs = extract_flanked_regions(seqs, END_SEQ, 33) # NOTE: 33 bp is an example; replace 33 with the bp length of the region of interest.
+proteins = [translate(seq) for seq in sliced_seqs if translate(seq)]
+
+# Print summary
+print(f"Total reads: {len(seqs)}")
+print(f"Valid 33-bp sliced reads: {len(sliced_seqs)}")
+print(f"Translated protein sequences: {len(proteins)}")
+print(f"Percent in-frame: {100*len(sliced_seqs)/len(seqs):.2f}%")
+
+# Clonal analysis
+clone_df = clonal_analysis(sliced_seqs, proteins)
+clone_csv = os.path.join(OUTPUT_DIR, f"{FILE_BASENAME}_clonal_analysis.csv")
+clone_df.to_csv(clone_csv, index=False)
+
+# Compute matrix
+mutation_matrix = compute_mutation_matrix(proteins, WT, residues)
+total_per_position = mutation_matrix.sum(axis=1, keepdims=True)
+mutation_fraction = mutation_matrix / total_per_position
+
+
+# Save mutation matrices
+df_counts = pd.DataFrame(mutation_matrix.astype(int), columns=residues, index=[f"{i+1} {WT[i]}" for i in range(len(WT))])
+df_fractions = pd.DataFrame(mutation_fraction, columns=residues, index=[f"{i+1} {WT[i]}" for i in range(len(WT))])
+with pd.ExcelWriter(os.path.join(OUTPUT_DIR, f"{FILE_BASENAME}_mutation_fractions.xlsx")) as writer:
+    df_fractions.to_excel(writer, sheet_name="Fractions")
+    df_counts.to_excel(writer, sheet_name="Counts")
+
+# Heatmap (function)
+def plot_heatmap(matrix, with_labels, filename):
+    plt.figure(figsize=(10, 6))
+    im = plt.imshow(matrix, cmap='viridis', aspect='auto')
+    plt.colorbar(label='Mutation Fraction')
+    plt.xticks(np.arange(len(residues)), residues)
+    plt.yticks(np.arange(len(WT)), [f"{i+1} {WT[i]}" for i in range(len(WT))])
+    plt.xlabel("Amino Acid")
+    plt.ylabel("Position")
+    if with_labels:
+        for i in range(matrix.shape[0]):
+            for j in range(matrix.shape[1]):
+                val = matrix[i, j]
+                if not np.isnan(val):
+                    plt.text(j, i, f"{val:.2f}", ha='center', va='center', fontsize=7, color='white')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, filename), dpi=300)
+    plt.close()
+
+# Generate both heatmaps
+plot_heatmap(mutation_fraction, with_labels=False, filename=f"{FILE_BASENAME}_heatmap.png")
+plot_heatmap(mutation_fraction, with_labels=True, filename=f"{FILE_BASENAME}_heatmap_labeled.png")
