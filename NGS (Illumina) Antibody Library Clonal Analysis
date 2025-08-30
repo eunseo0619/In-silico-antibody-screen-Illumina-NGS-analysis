@@ -2,7 +2,7 @@
 """
 @author: EunSeo_Michelle_Choi
 
-Python script for in silico NGS (PacBio) clonal analysis of antibody library and screen outputs.
+Python script for in silico NGS (Illumina) clonal analysis of antibody library and screen outputs.
 This script:
 - Reads FASTQ files and extracts a specific region flanking a constant motif
 - Translates in-frame DNA sequences to protein
